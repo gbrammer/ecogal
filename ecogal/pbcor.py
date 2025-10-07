@@ -254,13 +254,21 @@ class EcogalFile:
         self,
         file_alma="2022.1.01644.S__all_MOSDEF_3324_b3_cont_noninter2sig.image.pbcor.fits",
         cutout_args=None,
+        file_pb=None,
+        meta=None,
+        **kwargs,
     ):
         """
         Helper functions for ecogal pbcof products
         """
         self.file_alma = file_alma
+        self.file_pb = file_pb
+        self.cutout_args = None
 
-        self.meta = get_pbcor_metadata(file_alma=self.file_alma)
+        if meta is None:
+            self.meta = get_pbcor_metadata(file_alma=self.file_alma)
+        else:
+            self.meta = meta
 
         if cutout_args is None:
             cache_file = get_ecogal_file(file_alma, cache=CACHE_DOWNLOADS)
@@ -292,8 +300,36 @@ class EcogalFile:
         return 2.99e8 / self.frequency
 
     @property
+    def stokes(self):
+        if "CRVAL4" in self.header:
+            return self.header["CRVAL4"]
+        else:
+            return None
+
+    @property
+    def wcs_flat_dimensions(self):
+        """ """
+        if self.wcs.naxis == 3:
+            return ([self.frequency],)
+        else:
+            return ([self.frequency], [self.stokes])
+
+    @property
     def footprint(self):
         return utils.SRegion(self.meta["footprint"])
+
+    @property
+    def nbeams(self):
+        """
+        Estimated number of beams within footprint
+        """
+        bsize_arcmin = (
+            np.sqrt(self.meta["bmaj"] ** 2 + self.meta["bmin"] ** 2) * 60
+        )
+        nbeams = self.footprint.sky_area(unit="arcmin2")[0].value / (
+            np.pi * bsize_arcmin**2
+        )
+        return nbeams
 
     @property
     def xyz_center(self):
@@ -304,7 +340,7 @@ class EcogalFile:
             self.wcs.all_world2pix(
                 [self.meta["ra_center"]],
                 [self.meta["dec_center"]],
-                [self.frequency],
+                *self.wcs_flat_dimensions,
                 0,
             )
         )
@@ -328,11 +364,16 @@ class EcogalFile:
         """
         Generate a primary beam map using FoV_sigma and the pixel scale
         """
+
+        if self.file_pb is not None:
+            with pyfits.open(self.file_pb) as im:
+                return np.squeeze(im[0].data) * self.mask
+
         NZ, NY, NX = self.shape
         xyz = self.wcs.all_world2pix(
             [self.meta["ra_center"]],
             [self.meta["dec_center"]],
-            [self.frequency],
+            *self.wcs_flat_dimensions,
             0,
         )
         yp, xp = np.indices((NY, NX))
@@ -363,15 +404,16 @@ class EcogalFile:
         Evaluate pixel value and noise at a position in the image
         """
         xyz = np.squeeze(
-            self.wcs.all_world2pix([ra], [dec], [self.frequency], 0)
+            self.wcs.all_world2pix([ra], [dec], *self.wcs_flat_dimensions, 0)
         )
         xyzi = np.round(xyz).astype(int)
 
         dra = (ra - self.meta["ra_center"]) * np.cos(dec / 180 * np.pi) * 3600
         dde = (dec - self.meta["dec_center"]) * 3600
         dx = np.sqrt(dra**2 + dde**2)
-
-        pbcor = np.exp(-(dx**2) / 2 / self.meta["FoV_sigma"] ** 2)
+        #
+        # pbcor = np.exp(-(dx**2) / 2 / self.meta["FoV_sigma"] ** 2)
+        pbcor = self.primary_beam[xyzi[1], xyzi[0]]
 
         resp = {
             "data": self.data[xyzi[1], xyzi[0]],
@@ -407,7 +449,7 @@ class EcogalFile:
         b = self.beam
 
         xyz = np.squeeze(
-            self.wcs.all_world2pix([ra], [dec], [self.frequency], 0)
+            self.wcs.all_world2pix([ra], [dec], *self.wcs_flat_dimensions, 0)
         )
         xyzi = np.round(xyz).astype(int)
 
@@ -527,11 +569,28 @@ class EcogalFile:
 
         ax.grid()
 
-        labels = [
-            self.file_alma.split("_")[0],
-            "_".join(self.file_alma.replace("__", "_").split("_")[1:-2]),
-            # f'Band {self.meta["band"]}  {self.frequency / 1.e9:.1f} GHz / {self.wavelength*1.e3:.2f} mm'
-        ]
+        if os.path.basename(self.file_alma).startswith("20"):
+            labels = [
+                self.file_alma.split("_")[0],
+                "_".join(self.file_alma.replace("__", "_").split("_")[1:-2]),
+                # f'Band {self.meta["band"]}  {self.frequency / 1.e9:.1f} GHz / {self.wavelength*1.e3:.2f} mm'
+            ]
+        else:
+            spl = (
+                os.path.basename(self.file_alma)
+                .replace("member.uid___", "")
+                .replace("_sci", "")
+            )
+            # labels = spl.split(".")[:2]
+            labels = [
+                "  ".join([self.meta["proposal_id"], spl.split(".")[0]]),
+                " ".join(
+                    [
+                        self.meta["target_name"],
+                        ("(mosaic)" if self.meta["is_mosaic"] else ""),
+                    ]
+                ),
+            ]
 
         for li, label in enumerate(labels):
             ax.text(
@@ -597,7 +656,14 @@ class EcogalFile:
         return pos, fig
 
     def cutout_with_thumb(
-        self, ra, dec, sx=3.0, fontsize=7, cutout_size=None, thumb_url=RGB_URL
+        self,
+        ra,
+        dec,
+        sx=3.0,
+        fontsize=7,
+        cutout_size=None,
+        thumb_url=RGB_URL,
+        **kwargs,
     ):
         """
         Cutout figure with a DJA JWST thumbnail
@@ -647,7 +713,6 @@ class EcogalFile:
 
         return fig
 
-
     def threshold_catalog(self, threshold=4, sign=1):
         """
         Simple source catalog from segments above a S/N threshold
@@ -662,7 +727,13 @@ class EcogalFile:
             measure.regionprops_table(
                 labels,
                 intensity_image=self.data * 1000 * sign,
-                properties=["label", "bbox", "centroid", "intensity_max"],
+                properties=[
+                    "label",
+                    "bbox",
+                    "centroid",
+                    "intensity_max",
+                    "area",
+                ],
             )
         )
         props.rename_column("centroid-0", "y")
@@ -670,12 +741,12 @@ class EcogalFile:
         props.rename_column("intensity_max", "smax")
         props.rename_column("label", "id")
 
-        props["ra"], props["dec"], nu = self.wcs.all_pix2world(
-            props["x"],
-            props["y"],
-            self.header["CRVAL3"] * np.ones(len(props)) - 1,
-            0,
-        )
+        props["area"] = props["area"].astype(int)
+
+        flat_dims = [np.zeros(len(props)) for dim in self.wcs_flat_dimensions]
+
+        _ = self.wcs.all_pix2world(props["x"], props["y"], *flat_dims, 0)
+        props["ra"], props["dec"] = _[:2]
 
         xi = np.round(props["x"]).astype(int)
         yi = np.round(props["y"]).astype(int)
@@ -690,56 +761,115 @@ class EcogalFile:
 
         return props
 
+    def blind_detection(
+        self,
+        threshold=4.0,
+        icdf_threshold=0.02,
+        negative_sn_index=-2,
+        **kwargs,
+    ):
+        """
+        Run blind detection
+        """
+        from scipy.stats import Normal
 
-def blind_detection(file_alma, threshold=4.0, icdf_threshold=0.02):
+        # eco = EcogalFile(file_alma=file_alma)
+
+        props = self.threshold_catalog(threshold=threshold)
+        nprops = self.threshold_catalog(threshold=threshold, sign=-1)
+
+        # clip_area = nprops["area"] > 1
+        #
+        # if (len(nprops) > 0) & (len(nprops) > clip_area.sum()):
+        #     nprops = nprops[~clip_area]
+
+        props["sn"] = props["scen"] / props["scen_err"]
+        props["sn"].format = ".2f"
+        if len(nprops) > 0:
+            nprops["sn"] = -nprops["scen"] / nprops["scen_err"]
+
+        # nbeams = (
+        #     np.pi * (self.meta["FoV_sigma"] / (self.meta["bmaj"] * 3600 / 2.35)) ** 2
+        # )
+        bsize_arcmin = (
+            np.sqrt(self.meta["bmaj"] ** 2 + self.meta["bmin"] ** 2) * 60
+        )
+        nbeams = self.footprint.sky_area(unit="arcmin2")[0].value / (
+            np.pi * bsize_arcmin**2
+        )
+
+        props["nbeams"] = int(nbeams)
+        props["nbeams"].description = "Estimated number of beams in FoV"
+
+        if len(nprops) > 0:
+            nso = np.argsort(nprops["sn"])
+            props["negative_snmax"] = nprops["sn"].max()
+            if len(nprops) >= -negative_sn_index:
+                props["negative_sn"] = nprops["sn"][nso][negative_sn_index]
+            else:
+                props["negative_sn"] = props["negative_snmax"]
+
+        else:
+            props["negative_snmax"] = -1.0
+            props["negative_sn"] = -1.0
+
+        props["negative_snmax"].format = ".2f"
+        props["negative_snmax"].description = (
+            "Maximum S/N of the inverted image"
+        )
+
+        props["negative_sn"].format = ".2f"
+        props["negative_sn"].description = (
+            "S/N[{negative_sn_index}] of the inverted image"
+        )
+
+        # thresh = -Normal().icdf(icdf_threshold / nbeams)
+        # props["spurious_threshold"] = thresh
+        # props["spurious_threshold"].format = ".2f"
+        props["spurious_count"] = Normal().cdf(-props["sn"]) * nbeams
+        props["spurious_count"].format = ".2e"
+        props["spurious_count"].description = (
+            "Expected spurious sources given S/N and FoV / beam"
+        )
+
+        props["dra"] = (
+            (props["ra"] - self.meta["ra_center"])
+            * 3600.0
+            / np.cos(props["dec"] / 180 * np.pi)
+        )
+        props["dde"] = (props["dec"] - self.meta["dec_center"]) * 3600.0
+
+        props["dx"] = np.sqrt(props["dra"] ** 2 + props["dde"] ** 2)
+
+        props["dx_pb"] = props["dx"] / self.meta["FoV_sigma"]
+        props["dx_pb"].format = ".3f"
+        props["dx_pb"].description = "Offset in units of the estimated PB size"
+
+        props["dx_beam"] = props["dx"] / (bsize_arcmin * 60)
+        props["dx_beam"].format = ".1f"
+        props["dx_beam"].description = "Offset in units of the beam"
+
+        props["dra"].format = ".2f"
+        props["dde"].format = ".2f"
+        props["dx"].format = ".2f"
+        props["dra"].unit = u.arcsec
+        props["dde"].unit = u.arcsec
+        props["dx"].unit = u.arcsec
+        props["ra"].format = ".6f"
+        props["dec"].format = ".6f"
+        props["smax"].format = ".2f"
+        props["scen"].format = ".2f"
+
+        return props
+
+
+def blind_detection(file_alma, **kwargs):
     """
     Run blind detection
     """
     from scipy.stats import Normal
 
     eco = EcogalFile(file_alma=file_alma)
-
-    props = eco.threshold_catalog(threshold=threshold)
-    nprops = eco.threshold_catalog(threshold=threshold, sign=-1)
-
-    props["sn"] = props["scen"] / props["scen_err"]
-    props["sn"].format = ".1f"
-    if len(nprops) > 0:
-        nprops["sn"] = -nprops["scen"] / nprops["scen_err"]
-
-    nbeams = (
-        np.pi * (eco.meta["FoV_sigma"] / (eco.meta["bmaj"] * 3600 / 2.35)) ** 2
-    )
-    props["nbeams"] = int(nbeams)
-
-    if len(nprops) > 0:
-        props["negative_snmax"] = nprops["sn"].max()
-    else:
-        props["negative_snmax"] = -1.0
-
-    props["negative_snmax"].format = ".2f"
-
-    thresh = -Normal().icdf(icdf_threshold / nbeams)
-    props["spurious_threshold"] = thresh
-    props["spurious_threshold"].format = ".2f"
-
-    props["dra"] = (
-        (props["ra"] - eco.meta["ra_center"])
-        * 3600.0
-        / np.cos(props["dec"] / 180 * np.pi)
-    )
-    props["dde"] = (props["dec"] - eco.meta["dec_center"]) * 3600.0
-
-    props["dx"] = np.sqrt(props["dra"] ** 2 + props["dde"] ** 2)
-
-    props["dx_pb"] = props["dx"] / eco.meta["FoV_sigma"]
-    props["dx_pb"].format = ".3f"
-
-    props["dra"].format = ".2f"
-    props["dde"].format = ".2f"
-    props["dx"].format = ".2f"
-    props["dra"].unit = u.arcsec
-    props["dde"].unit = u.arcsec
-    props["dx"].unit = u.arcsec
+    props = eco.blind_detection(**kwargs)
 
     return eco, props
